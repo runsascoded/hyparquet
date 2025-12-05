@@ -22,10 +22,6 @@
     "type": "git",
     "url": "git+https://github.com/hyparam/hyparquet.git"
   },
-  "files": [
-    "src",
-    "types"
-  ],
   "type": "module",
   "types": "types/index.d.ts",
   "main": "src/index.js",
@@ -45,22 +41,5 @@
       "import": "./src/*.js"
     }
   },
-  "sideEffects": false,
-  "scripts": {
-    "build:types": "tsc -p ./tsconfig.build.json",
-    "coverage": "vitest run --coverage --coverage.include=src",
-    "lint": "eslint",
-    "lint:fix": "eslint --fix",
-    "prepare": "npm run build:types",
-    "test": "vitest run"
-  },
-  "devDependencies": {
-    "@types/node": "24.10.1",
-    "@vitest/coverage-v8": "4.0.14",
-    "eslint": "9.39.1",
-    "eslint-plugin-jsdoc": "61.4.1",
-    "hyparquet-compressors": "1.1.1",
-    "typescript": "5.9.3",
-    "vitest": "4.0.14"
-  }
+  "sideEffects": false
 }
