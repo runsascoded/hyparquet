@@ -7,8 +7,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: runsascoded/gh-pnpm-dist@v1
+      - uses: runsascoded/npm-dist@v1
         with:
           source_ref: main
           build_command: pnpm run build:types
-          source_dirs: src,types
+          preserve_dirs: src,types
