@@ -8,7 +8,7 @@
  * @param {ParquetReadOptions} options
  * @returns {QueryPlan}
  */
-export function parquetPlan({ metadata, rowStart, rowEnd, columns, filter }: ParquetReadOptions): QueryPlan;
+export function parquetPlan({ metadata, rowStart, rowEnd, columns, filter, columnChunkAggregation }: ParquetReadOptions): QueryPlan;
 /**
  * @param {ColumnMetaData} columnMetadata
  * @returns {ByteRange}

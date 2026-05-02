@@ -44,6 +44,7 @@ export interface BaseParquetReadOptions {
   utf8?: boolean // decode byte arrays as utf8 strings (default true)
   parsers?: ParquetParsers // custom parsers to decode advanced types
   geoparquet?: boolean // parse geoparquet metadata and set logical type to geometry/geography for geospatial columns (default true)
+  columnChunkAggregation?: number // coalesce a row group's selected column chunks into one byte range when their span is below this many bytes. Default: 32mb when `columns` is unset, 0 (no coalescing) when `columns` is set. Pass an explicit value (e.g. on high-latency stores) to coalesce even with `columns` projected; pass 0 to always issue one fetch per chunk.
 }
 
 interface ArrayRowFormat {
