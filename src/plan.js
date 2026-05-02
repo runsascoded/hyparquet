@@ -3,8 +3,10 @@ import { parquetSchema } from './metadata.js'
 import { getPhysicalColumns } from './schema.js'
 import { concat } from './utils.js'
 
-// Combine column chunks into a single byte range if less than 32mb
-const columnChunkAggregation = 1 << 25 // 32mb
+// Default: combine column chunks into a single byte range if less than 32mb
+// (only applied when no `columns` projection is set, unless caller opts in via
+// `columnChunkAggregation`).
+const defaultColumnChunkAggregation = 1 << 25 // 32mb
 
 /**
  * @import {AsyncBuffer, ByteRange, ColumnMetaData, GroupPlan, ParquetReadOptions, QueryPlan} from '../src/types.js'
@@ -16,8 +18,13 @@ const columnChunkAggregation = 1 << 25 // 32mb
  * @param {ParquetReadOptions} options
  * @returns {QueryPlan}
  */
-export function parquetPlan({ metadata, rowStart = 0, rowEnd = Infinity, columns, filter }) {
+export function parquetPlan({ metadata, rowStart = 0, rowEnd = Infinity, columns, filter, columnChunkAggregation }) {
   if (!metadata) throw new Error('parquetPlan requires metadata')
+  // When unset, preserve legacy behavior: coalesce only when reading all
+  // columns. When set explicitly, honor the threshold even with `columns`
+  // projected (callers on high-latency stores e.g. R2 prefer a small amount
+  // of overfetch over many tiny range GETs).
+  const aggBytes = columnChunkAggregation ?? (columns ? 0 : defaultColumnChunkAggregation)
   /** @type {GroupPlan[]} */
   const groups = []
   /** @type {ByteRange[]} */
@@ -48,8 +55,8 @@ export function parquetPlan({ metadata, rowStart = 0, rowEnd = Infinity, columns
 
       // map group plan to ranges
       const groupSize = ranges[ranges.length - 1]?.endByte - ranges[0]?.startByte
-      if (!columns && groupSize < columnChunkAggregation) {
-        // full row group
+      if (aggBytes > 0 && groupSize < aggBytes) {
+        // coalesce all selected column chunks of this row group into one fetch
         fetches.push({
           startByte: ranges[0].startByte,
           endByte: ranges[ranges.length - 1].endByte,
