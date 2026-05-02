@@ -49,6 +49,7 @@ export interface BaseParquetReadOptions {
   geoparquet?: boolean // parse geoparquet metadata and set logical type to geometry/geography for geospatial columns (default true)
   useOffsetIndex?: boolean // use offset index to limit column chunk reads when available (default false)
   useBloomFilters?: boolean // fetch bloom filters to enable row-group skipping on $eq/$in predicates (default false)
+  columnChunkAggregation?: number // byte threshold for coalescing a row group's adjacent column chunks into one fetch. Default: 2mb when `columns` is unset, 0 (one fetch per chunk) when `columns` is set. Pass an explicit value (e.g. on high-latency stores) to coalesce even with `columns` projected; pass 0 to disable coalescing entirely.
 }
 
 interface ArrayRowFormat {

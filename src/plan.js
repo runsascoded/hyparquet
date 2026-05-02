@@ -17,8 +17,14 @@ const runLimit = 1 << 21 // 2mb
  * @param {ParquetReadOptions & { bloomFiltersByGroup?: Record<string, BloomFilter>[], schemaElements?: Record<string, SchemaElement> }} options
  * @returns {QueryPlan}
  */
-export function parquetPlan({ metadata, rowStart = 0, rowEnd = Infinity, columns, filter, filterStrict = true, useOffsetIndex = false, bloomFiltersByGroup, schemaElements }) {
+export function parquetPlan({ metadata, rowStart = 0, rowEnd = Infinity, columns, filter, filterStrict = true, useOffsetIndex = false, columnChunkAggregation, bloomFiltersByGroup, schemaElements }) {
   if (!metadata) throw new Error('parquetPlan requires metadata')
+  // Byte threshold for coalescing a run of adjacent column chunks into one
+  // fetch. Default: `runLimit` (2mb) when reading all columns, 0 (one fetch per
+  // chunk) when `columns` is projected. Callers on high-latency stores (R2/S3)
+  // can pass an explicit value to coalesce even with `columns` set — bounded
+  // overfetch beats many tiny range GETs. Pass 0 to disable coalescing entirely.
+  const aggBytes = columnChunkAggregation ?? (columns ? 0 : runLimit)
   /** @type {GroupPlan[]} */
   const groups = []
   /** @type {ByteRange[]} */
@@ -78,7 +84,7 @@ export function parquetPlan({ metadata, rowStart = 0, rowEnd = Infinity, columns
       const selectEnd = Math.min(rowEnd - groupStart, groupRows)
       groups.push({ chunks, rowGroup, groupStart, groupRows, selectStart, selectEnd })
 
-      // combine runs of column chunks
+      // combine runs of column chunks into fetches, up to `aggBytes`
       /** @type {ByteRange | undefined} */
       let run
       for (const chunk of chunks) {
@@ -86,15 +92,16 @@ export function parquetPlan({ metadata, rowStart = 0, rowEnd = Infinity, columns
           indexes.push(chunk.offsetIndex)
         } else {
           const { range } = chunk
-          if (columns) {
-            fetches.push(range)
-          } else if (run && range.endByte - run.startByte <= runLimit) {
-            // extend range
+          if (aggBytes > 0 && run && range.endByte - run.startByte <= aggBytes) {
+            // extend run
             run.endByte = range.endByte
-          } else {
-            // new range
+          } else if (aggBytes > 0) {
+            // start new run
             if (run) fetches.push(run)
             run = { ...range }
+          } else {
+            // no coalescing: one fetch per chunk
+            fetches.push(range)
           }
         }
       }

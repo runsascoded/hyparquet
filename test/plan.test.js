@@ -60,4 +60,76 @@ describe('parquetPlan', () => {
     )
     expect(hasOffsetIndex).toBe(true)
   })
+
+  // offset_indexed.parquet: 2 row groups, cols [id, content].
+  //   rg0: id {4,438}, content {438,14772}          (span 14768)
+  //   rg1: id {14772,15208}, content {15208,29507}  (span 14735)
+  describe('columnChunkAggregation option', () => {
+    it('default behavior: columns set → no coalescing (one fetch per chunk)', async () => {
+      const file = await asyncBufferFromFile('test/files/offset_indexed.parquet')
+      const metadata = await parquetMetadataAsync(file)
+      const plan = parquetPlan({ file, metadata, columns: ['id', 'content'] })
+      // Both chunks of each row group emitted as separate fetches.
+      expect(plan.fetches).toEqual([
+        { startByte: 4, endByte: 438 },
+        { startByte: 438, endByte: 14772 },
+        { startByte: 14772, endByte: 15208 },
+        { startByte: 15208, endByte: 29507 },
+      ])
+    })
+
+    it('columns + columnChunkAggregation ≥ group span → coalesces within each rg', async () => {
+      const file = await asyncBufferFromFile('test/files/offset_indexed.parquet')
+      const metadata = await parquetMetadataAsync(file)
+      const plan = parquetPlan({
+        file, metadata, columns: ['id', 'content'], columnChunkAggregation: 1 << 25,
+      })
+      // Same shape as default no-columns case: one fetch per row group.
+      expect(plan.fetches).toEqual([
+        { startByte: 4, endByte: 14772 },
+        { startByte: 14772, endByte: 29507 },
+      ])
+    })
+
+    it('columns + columnChunkAggregation smaller than the chunk gap → no coalescing', async () => {
+      const file = await asyncBufferFromFile('test/files/offset_indexed.parquet')
+      const metadata = await parquetMetadataAsync(file)
+      // content chunk sits ~14.7kb past the run start; threshold of 1000 never extends.
+      const plan = parquetPlan({
+        file, metadata, columns: ['id', 'content'], columnChunkAggregation: 1000,
+      })
+      expect(plan.fetches).toEqual([
+        { startByte: 4, endByte: 438 },
+        { startByte: 438, endByte: 14772 },
+        { startByte: 14772, endByte: 15208 },
+        { startByte: 15208, endByte: 29507 },
+      ])
+    })
+
+    it('no columns + columnChunkAggregation: 0 → disables default coalescing', async () => {
+      const file = await asyncBufferFromFile('test/files/offset_indexed.parquet')
+      const metadata = await parquetMetadataAsync(file)
+      const plan = parquetPlan({ file, metadata, columnChunkAggregation: 0 })
+      expect(plan.fetches).toEqual([
+        { startByte: 4, endByte: 438 },
+        { startByte: 438, endByte: 14772 },
+        { startByte: 14772, endByte: 15208 },
+        { startByte: 15208, endByte: 29507 },
+      ])
+    })
+
+    it('columns subset + coalesce: one fetch per rg covering the subset span', async () => {
+      const file = await asyncBufferFromFile('test/files/offset_indexed.parquet')
+      const metadata = await parquetMetadataAsync(file)
+      const plan = parquetPlan({
+        file, metadata, columns: ['content'], columnChunkAggregation: 1 << 25,
+      })
+      // Only the content chunk of each rg is selected; a run of one chunk is
+      // just that chunk's range.
+      expect(plan.fetches).toEqual([
+        { startByte: 438, endByte: 14772 },
+        { startByte: 15208, endByte: 29507 },
+      ])
+    })
+  })
 })
