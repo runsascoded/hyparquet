@@ -45,7 +45,7 @@ async function rowGroupFailingFile() {
        * @returns {Promise<ArrayBuffer> | ArrayBuffer}
        */
       slice(start, end) {
-        if (start === failedStart && end === failedEnd) {
+        if (start < failedEnd && (end ?? file.byteLength) > failedStart) {
           return Promise.reject(new Error('simulated read failure'))
         }
         return file.slice(start, end)
@@ -410,7 +410,7 @@ describe('parquetRead', () => {
     expect(counting.bytes).toBe(14768)
   })
 
-  it('does not groups column chunks when columns are specified', async () => {
+  it('merges adjacent selected column chunks without over-fetching', async () => {
     const file = await asyncBufferFromFile('test/files/offset_indexed.parquet')
     const metadata = await parquetMetadataAsync(file)
     const counting = countingBuffer(file)
@@ -424,8 +424,25 @@ describe('parquetRead', () => {
       columns: ['id', 'content'],
     })
     expect(row).toEqual({ id: 26n, content: expect.any(String) })
-    expect(counting.fetches).toBe(2) // 2 column chunks
+    expect(counting.fetches).toBe(1) // 2 byte-adjacent column chunks
     expect(counting.bytes).toBe(14768)
+  })
+
+  it('bridges unselected chunks across row groups up to maxOverfetchRatio', async () => {
+    const file = await asyncBufferFromFile('test/files/offset_indexed.parquet')
+    const metadata = await parquetMetadataAsync(file)
+    /**
+     * @param {number | undefined} maxOverfetchRatio
+     * @returns {Promise<{ rows: number, fetches: number, bytes: number }>}
+     */
+    async function read(maxOverfetchRatio) {
+      const counting = countingBuffer(file)
+      const rows = await parquetReadObjects({ file: counting, metadata, columns: ['id'], maxOverfetchRatio })
+      return { rows: rows.length, fetches: counting.fetches, bytes: counting.bytes }
+    }
+    // id chunks {4,438} and {14772,15208}, separated by rg0's content chunk
+    expect(await read(undefined)).toEqual({ rows: 200, fetches: 2, bytes: 870 })
+    expect(await read(0.95)).toEqual({ rows: 200, fetches: 1, bytes: 15204 })
   })
 
   it('reads individual pages', async () => {

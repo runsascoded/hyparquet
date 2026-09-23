@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { parquetMetadataAsync } from '../src/index.js'
 import { asyncBufferFromFile } from '../src/node.js'
-import { parquetPlan, prefetchPageIndexes } from '../src/plan.js'
+import { coalesceByteRanges, parquetPlan, prefetchPageIndexes } from '../src/plan.js'
 
 /**
  * @import {PageLocation, PageRanges} from '../src/types.js'
@@ -16,9 +16,9 @@ describe('parquetPlan', () => {
       metadata,
       rowStart: 0,
       rowEnd: 200,
+      // adjacent row groups coalesce into one fetch
       fetches: [
-        { startByte: 4, endByte: 14772 },
-        { startByte: 14772, endByte: 29507 },
+        { startByte: 4, endByte: 29507 },
       ],
       groups: [
         {
@@ -145,5 +145,132 @@ describe('parquetPlan', () => {
 
     expect(plan.groups).toHaveLength(2)
     expect(plan.groups[0].chunks).toBe(plan.groups[1].chunks)
+  })
+})
+
+// offset_indexed.parquet: 2 row groups, cols [id, content], laid out back to back:
+//   rg0: id {4,438}, content {438,14772}
+//   rg1: id {14772,15208}, content {15208,29507}
+describe('parquetPlan coalescing', () => {
+  /**
+   * @param {{ columns?: string[], maxOverfetchRatio?: number, maxRunBytes?: number }} options
+   * @returns {Promise<import('../src/types.js').ByteRange[]>}
+   */
+  async function planFetches(options) {
+    const file = await asyncBufferFromFile('test/files/offset_indexed.parquet')
+    const metadata = await parquetMetadataAsync(file)
+    return parquetPlan({ file, metadata, ...options }).fetches
+  }
+
+  it('merges adjacent selected chunks across the row-group boundary', async () => {
+    expect(await planFetches({ columns: ['id', 'content'] })).toEqual([
+      { startByte: 4, endByte: 29507 },
+    ])
+  })
+
+  it('splits on unselected gaps by default when columns are projected', async () => {
+    expect(await planFetches({ columns: ['id'] })).toEqual([
+      { startByte: 4, endByte: 438 },
+      { startByte: 14772, endByte: 15208 },
+    ])
+  })
+
+  it('bridges unselected gaps up to maxOverfetchRatio', async () => {
+    // merged run: 15204 bytes, 870 wanted => 14334/15204 = 0.943 untargeted
+    const merged = [{ startByte: 4, endByte: 15208 }]
+    expect(await planFetches({ columns: ['id'], maxOverfetchRatio: 0.95 })).toEqual(merged)
+    expect(await planFetches({ columns: ['id'], maxOverfetchRatio: 0.94 })).toEqual([
+      { startByte: 4, endByte: 438 },
+      { startByte: 14772, endByte: 15208 },
+    ])
+  })
+
+  it('splits a run that would exceed maxRunBytes', async () => {
+    expect(await planFetches({ maxRunBytes: 15000 })).toEqual([
+      { startByte: 4, endByte: 14772 },
+      { startByte: 14772, endByte: 29507 },
+    ])
+  })
+
+  it('issues one fetch per chunk with maxRunBytes 0', async () => {
+    expect(await planFetches({ maxRunBytes: 0 })).toEqual([
+      { startByte: 4, endByte: 438 },
+      { startByte: 438, endByte: 14772 },
+      { startByte: 14772, endByte: 15208 },
+      { startByte: 15208, endByte: 29507 },
+    ])
+  })
+})
+
+describe('coalesceByteRanges', () => {
+  it('merges only overlapping or touching ranges by default', () => {
+    expect(coalesceByteRanges([
+      { startByte: 30, endByte: 40 },
+      { startByte: 0, endByte: 10 },
+      { startByte: 10, endByte: 20 },
+      { startByte: 15, endByte: 25 },
+    ])).toEqual([
+      { startByte: 0, endByte: 25 },
+      { startByte: 30, endByte: 40 },
+    ])
+  })
+
+  it('merges overlapping ranges even past maxRunBytes', () => {
+    expect(coalesceByteRanges([
+      { startByte: 0, endByte: 10 },
+      { startByte: 5, endByte: 20 },
+      { startByte: 20, endByte: 30 },
+    ], { maxRunBytes: 5 })).toEqual([
+      { startByte: 0, endByte: 20 },
+      { startByte: 20, endByte: 30 },
+    ])
+  })
+
+  it('does not count overlapping bytes twice toward the covered share', () => {
+    // covered = [0,20) = 20 of 40 bytes, so 0.25 untargeted; summing range
+    // lengths would count 40 covered bytes and merge even at ratio 0
+    const ranges = [
+      { startByte: 0, endByte: 20 },
+      { startByte: 0, endByte: 10 },
+      { startByte: 30, endByte: 40 },
+    ]
+    expect(coalesceByteRanges(ranges, { maxOverfetchRatio: 0.24 })).toEqual([
+      { startByte: 0, endByte: 20 },
+      { startByte: 30, endByte: 40 },
+    ])
+    expect(coalesceByteRanges(ranges, { maxOverfetchRatio: 0.25 })).toEqual([
+      { startByte: 0, endByte: 40 },
+    ])
+  })
+
+  // walk shape: 3 row groups x 11 columns x 25kb, columns [0, 3, 5, 9] selected
+  const chunk = 25_000
+  const group = 11 * chunk
+  const walk = [0, 1, 2].flatMap(g => [0, 3, 5, 9].map(c => ({
+    startByte: g * group + c * chunk,
+    endByte: g * group + (c + 1) * chunk,
+  })))
+
+  it('coalesces a projected run of row groups into one fetch at ratio 0.7', () => {
+    // 300kb wanted of an 800kb span: 0.625 untargeted
+    expect(coalesceByteRanges(walk, { maxOverfetchRatio: 0.7 })).toEqual([
+      { startByte: 0, endByte: 800_000 },
+    ])
+  })
+
+  it('splits where the greedy run would exceed the ratio', () => {
+    // run 1 stops before rg1 col 9: [0, 525000) would be 325000/525000 = 0.62 untargeted
+    expect(coalesceByteRanges(walk, { maxOverfetchRatio: 0.6 })).toEqual([
+      { startByte: 0, endByte: 425_000 },
+      { startByte: 500_000, endByte: 800_000 },
+    ])
+  })
+
+  it('bounds runs with maxRunBytes', () => {
+    expect(coalesceByteRanges(walk, { maxOverfetchRatio: 1, maxRunBytes: group })).toEqual([
+      { startByte: 0, endByte: 250_000 },
+      { startByte: 275_000, endByte: 525_000 },
+      { startByte: 550_000, endByte: 800_000 },
+    ])
   })
 })

@@ -54,6 +54,8 @@ export interface BaseParquetReadOptions {
   useOffsetIndex?: boolean // use offset index to limit column chunk reads when available (default false)
   useBloomFilters?: boolean // fetch bloom filters to enable row-group skipping on $eq/$in predicates (default false)
   usePageIndex?: boolean // fetch page indexes (column index + offset index) for filter columns to skip pages that cannot match (default false)
+  maxOverfetchRatio?: number // max share (0..1) of one coalesced fetch that is bytes no selected chunk needs (default 1 without `columns`, 0 with)
+  maxRunBytes?: number // max bytes per coalesced fetch; runs may span row groups (default 2mb)
 }
 
 interface ArrayRowFormat {

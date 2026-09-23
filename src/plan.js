@@ -8,7 +8,7 @@ import { getPhysicalColumns } from './schema.js'
  * @import {AsyncBuffer, BloomFilter, ByteRange, ChunkPlan, ColumnPageStats, FileMetaData, GroupPlan, PageLocation, PageRanges, ParquetParsers, ParquetQueryFilter, ParquetReadOptions, QueryPlan, RowGroup, SchemaElement, SchemaTree} from '../src/types.js'
  */
 
-// Combine column chunks if less than 2mb
+// Default cap on one coalesced fetch
 const runLimit = 1 << 21 // 2mb
 
 /**
@@ -34,9 +34,24 @@ export function parquetPlan(options) {
     fetches.push(...groupPlan.fetches)
     indexes.push(...groupPlan.indexes)
   }
-  fetches.push(...indexes)
+  // one pass over every planned range, so runs can span row groups
+  const coalesced = coalesceByteRanges([...fetches, ...indexes], coalesceBudget(options))
 
-  return { metadata, rowStart, rowEnd: scanPlan.rowEnd, columns, fetches, groups }
+  return { metadata, rowStart, rowEnd: scanPlan.rowEnd, columns, fetches: coalesced, groups }
+}
+
+/**
+ * Resolve per-call coalescing budgets. Without a projection every chunk is
+ * wanted, so runs are only span-limited; with one, only touching ranges merge.
+ *
+ * @param {{ columns?: string[], maxOverfetchRatio?: number, maxRunBytes?: number }} options
+ * @returns {{ maxOverfetchRatio: number, maxRunBytes: number }}
+ */
+function coalesceBudget({ columns, maxOverfetchRatio, maxRunBytes }) {
+  return {
+    maxOverfetchRatio: maxOverfetchRatio ?? (columns ? 0 : 1),
+    maxRunBytes: maxRunBytes ?? runLimit,
+  }
 }
 
 /**
@@ -148,22 +163,15 @@ export function parquetPlanGroup({ rowGroup, groupStart, groupRows, ranges, colu
     }
   }
 
-  /** @type {ByteRange | undefined} */
-  let run
+  // raw ranges; callers coalesce (parquetPlan does so across row groups)
   for (const chunk of chunks) {
     if ('pageLocations' in chunk) continue
     if ('offsetIndex' in chunk) {
       indexes.push(chunk.offsetIndex)
-    } else if (columns) {
-      fetches.push(chunk.range)
-    } else if (run && chunk.range.endByte - run.startByte <= runLimit) {
-      run.endByte = chunk.range.endByte
     } else {
-      if (run) fetches.push(run)
-      run = { ...chunk.range }
+      fetches.push(chunk.range)
     }
   }
-  if (run) fetches.push(run)
   const groups = ranges.map(([selectStart, selectEnd]) => ({
     chunks,
     rowGroup,
@@ -413,24 +421,39 @@ export async function prefetchPageIndexes({ file, metadata, filter, filterStrict
 }
 
 /**
- * Merge overlapping or exactly touching byte ranges without adding bytes.
+ * Coalesce byte ranges into fewer fetches, agnostic to what the ranges are.
+ * Greedy over ranges sorted by start: a range joins the current run iff the
+ * run stays within `maxRunBytes` and the bytes no input range covers stay
+ * within `maxOverfetchRatio` of the run. Overlapping ranges always merge.
+ * The defaults merge only overlapping or exactly touching ranges.
  *
  * @param {ByteRange[]} ranges
+ * @param {object} [options]
+ * @param {number} [options.maxOverfetchRatio] max share (0..1) of a run that no input range covers (default 0)
+ * @param {number} [options.maxRunBytes] max bytes per run (default Infinity)
  * @returns {ByteRange[]}
  */
-function coalesceByteRanges(ranges) {
+export function coalesceByteRanges(ranges, { maxOverfetchRatio = 0, maxRunBytes = Infinity } = {}) {
   const sorted = ranges
     .map(range => ({ ...range }))
     .sort((a, b) => a.startByte - b.startByte || a.endByte - b.endByte)
   /** @type {ByteRange[]} */
   const merged = []
+  let covered = 0 // bytes of the current run covered by input ranges
   for (const range of sorted) {
     const last = merged[merged.length - 1]
-    if (last && range.startByte <= last.endByte) {
-      last.endByte = Math.max(last.endByte, range.endByte)
-    } else {
-      merged.push(range)
+    if (last) {
+      const endByte = Math.max(last.endByte, range.endByte)
+      const total = endByte - last.startByte
+      const nextCovered = covered + Math.max(0, range.endByte - Math.max(range.startByte, last.endByte))
+      if (range.startByte < last.endByte || total <= maxRunBytes && total - nextCovered <= maxOverfetchRatio * total) {
+        last.endByte = endByte
+        covered = nextCovered
+        continue
+      }
     }
+    merged.push(range)
+    covered = range.endByte - range.startByte
   }
   return merged
 }

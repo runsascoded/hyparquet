@@ -1,6 +1,6 @@
 # Spec: format-agnostic byte-range coalescing across row groups
 
-Status: **open** (2026-09-23). Author: pyrmts session (`$c/pyrmts`, `js/packages/pyrmts/src/walkdiff.ts`); originating workload: the index-free diff walk over cw's 10M-row path-index parquets on R2.
+Status: **done** (2026-09-23), on top of upstream 1.31.1. Author: pyrmts session (`$c/pyrmts`, `js/packages/pyrmts/src/walkdiff.ts`); originating workload: the index-free diff walk over cw's 10M-row path-index parquets on R2.
 
 ## Problem
 
@@ -27,9 +27,16 @@ maxOverfetchRatio?: number
 maxRunBytes?: number
 ```
 
-`columnChunkAggregation` (the fork's existing opt-in, a byte threshold on a run) keeps working: treat it as `maxRunBytes` with `maxOverfetchRatio = 1` for back-compat, and document it as superseded.
+`columnChunkAggregation` (the fork's earlier opt-in, a per-row-group byte threshold on a run) is **removed**, not aliased: `{ maxRunBytes: N, maxOverfetchRatio: 1 }` expresses it exactly, and additionally lets runs span row groups. ctbk's `gbfs/api` passes it in three `parquetReadObjects` calls (pinned to fork dist `0f355ea`); it ports to the new options on its next dist-SHA bump. An unported call is silently ignored (reverting to one GET per chunk), so the port is required, not optional.
 
 Index ranges (offset/column index blocks, bloom filters) go through the same merge — they sit just before the footer and are often adjacent to each other.
+
+## As built
+
+- `coalesceByteRanges(ranges, { maxOverfetchRatio = 0, maxRunBytes = Infinity })` in `src/plan.js`, exported. It generalizes upstream's existing coalescer for page-index fetches (whose behavior is these defaults: merge only overlapping or touching ranges). Covered bytes are counted as the union of input ranges, so overlapping ranges are not double-counted. Overlapping ranges always merge, even past `maxRunBytes`: splitting them would fetch the shared bytes twice.
+- `parquetPlanGroup` now returns raw chunk ranges; `parquetPlan` runs one pass over every group's chunk ranges plus index ranges. Re-coalescing already-merged per-group runs would count their gap bytes as wanted and understate the ratio.
+- Resolved defaults (`coalesceBudget`): `maxOverfetchRatio = columns ? 0 : 1`, `maxRunBytes = 2 MB` in both cases. Ratio 1 without a projection matches the old span-limited behavior; with a projection the spec left `maxRunBytes` open, and 2 MB keeps single GETs bounded (the walk passes `Infinity`).
+- Behavior changes vs. upstream: all-column reads merge adjacent row groups (up to 2 MB); projected reads merge byte-adjacent selected chunks, within and across groups (same bytes, fewer GETs). Two upstream tests encoded the old boundaries and were updated; a failure-injection helper now fails any slice overlapping the target chunk rather than only an exact-match slice.
 
 ## Non-goals
 
@@ -38,5 +45,7 @@ Index ranges (offset/column index blocks, bloom filters) go through the same mer
 
 ## Acceptance
 
-- Unit tests on `parquetPlan`: (a) two adjacent row groups, all columns → one fetch; (b) with `columns` and ratio 0 → adjacent selected chunks merge across the group boundary, unselected gaps split; (c) ratio 0.7 over the walk's shape (11 columns, 4 selected, ~25 KB each) → one fetch per run of groups; (d) `maxRunBytes` splits a run that would exceed it; (e) `columnChunkAggregation` back-compat.
+- Unit tests on `parquetPlan` (`test/plan.test.js`, `offset_indexed.parquet`): (a) two adjacent row groups, all columns → one fetch; (b) with `columns` and ratio 0 → adjacent selected chunks merge across the group boundary, unselected gaps split; ratio 0.95 bridges the gap, 0.94 does not (0.943 untargeted); (d) `maxRunBytes` splits a run, and `0` gives one fetch per chunk. (e) dropped with `columnChunkAggregation`.
+- (c) as literal-range tests on `coalesceByteRanges` over the walk's shape (3 groups × 11 columns × 25 KB, 4 selected): ratio 0.7 → one 800 KB fetch; ratio 0.6 → split before rg1's last column; `maxRunBytes` = one group → one fetch per group. Plus overlap and union-accounting cases.
+- End to end (`test/read.test.js`): `parquetReadObjects({ columns: ['id'] })` takes 2 GETs / 870 B by default and 1 GET / 15,204 B at `maxOverfetchRatio: 0.95`, confirming the options thread through `prepareParquetRead`.
 - The walk (`pyrmts` `SnapshotReader.readRun`) can drop its memory-backed `AsyncBuffer` and call `parquetReadObjects({ columns, maxOverfetchRatio: 0.7, maxRunBytes: Infinity })` with the same 48 GETs for the fleet-root view.
