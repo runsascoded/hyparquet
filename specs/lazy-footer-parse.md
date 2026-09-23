@@ -1,111 +1,82 @@
 # Spec: lazy footer parsing for high-rg-count shards
 
-Status: **open** (2026-05-02). Author: ryan@runsascoded.com (originating
-workload: ctbk.dev `gbfs/api` Cloudflare Worker).
+Status: **open** (2026-05-02; measured and re-ranked 2026-09-23 on hyparquet 1.31.1). Author: ryan@runsascoded.com (originating workload: ctbk.dev `gbfs/api` Cloudflare Worker).
 
 ## Problem
 
-Footer parse memory scales with `rg-count × col-count`. For
-high-rg-count shards (small files with one rg per pruning unit), a
-caller that opens many shards concurrently inside a 128 MB CFW can OOM
-even though the on-disk footer bytes are small.
+Footer parse memory scales with `rg-count × col-count`. For high-rg-count shards (small files with one rg per pruning unit), a caller that opens many shards concurrently inside a 128 MB CFW can OOM even though the on-disk footer bytes are small.
 
-Concrete repro from ctbk: ~24 shards × ~2400 rgs × 12 cols ≈ **691,200
-`ColumnChunkMetaData` JS objects** in flight, with `Statistics`
-containing decoded string `min_value`/`max_value`. Worker hits "Exceeded
-Memory Limit" reliably.
+Concrete repro from ctbk: ~24 shards × ~2400 rgs × 12 cols ≈ **691,200 `ColumnChunkMetaData` JS objects** in flight. Worker hits "Exceeded Memory Limit" reliably.
 
-ctbk's workaround was to bump the writer's `rowGroupSize` 60 → 600
-(~241 rgs/shard). Sufficient for our scale but loses pruning
-granularity; doesn't fix the underlying parser behavior.
+ctbk's workaround was to bump the writer's `rowGroupSize` 60 → 600 (~241 rgs/shard). Sufficient for its scale but loses pruning granularity; doesn't fix the underlying parser behavior.
+
+The same cost shows up as CPU for pyrmts: cw's path-index parquets have 1,262 row groups × 11 columns (~14K column-chunk objects per file), a 7–15 ms parse that pyrmts caches around.
 
 ## Root cause
 
-`parquetMetadata`'s Thrift parse materializes a JS object for every
-field of every `ColumnChunkMetaData`, including:
+`parquetMetadata`'s Thrift parse materializes a JS object for every field of every `ColumnChunkMetaData`: nested `meta_data` and `statistics` objects, `encodings` / `path_in_schema` / `encoding_stats` arrays, several BigInt offsets and sizes, and the decoded `min_value` / `max_value`.
 
-- `meta_data.statistics.min_value` / `max_value` — decoded into JS
-  string/number eagerly. For our `station_id` columns this is a ~20-char
-  string per rg per shard.
-- `meta_data.encodings`, `meta_data.encoding_stats`, `meta_data.path_in_schema`,
-  `meta_data.key_value_metadata` — all eagerly materialized regardless
-  of whether the caller needs them.
-- Per-column `OffsetIndex` / `ColumnIndex` references — small but
-  multiplied by rg-count × col-count.
+The original draft assumed the decoded stat strings dominate (est. 60–80% of per-rg memory). **Measurement says otherwise: the per-chunk object skeleton dominates.** See below.
 
-Range-reading the footer (`suffixStart`-style partial download) does
-**not** help: footer bytes are small in absolute terms; it's the
-*decoded JS representation* that's heavy.
+## Measurements (2026-09-23, hyparquet 1.31.1)
 
-## Options (rough order: smallest API impact first)
+Synthetic files modelled on ctbk's avail-v3 aggregate schema (`s2_cell` STRING, `dt` INT64, five JSON-histogram STRING columns with ~80-char values), 2,400 row groups, written by `hyparquet-writer` (which writes stats by default, as ctbk's shards have). Retained heap is the `heapUsed` delta across `parquetMetadata()` with the result held live, after forced GC; parse time is the median of 7 parses. The "2 cols" rows are files that only contain 2 of the columns, i.e. what `metadataColumns` projection would retain.
 
-### 1. Lazy stats decode
+| file | footer | retained / rg | parse | ×24 shards retained |
+|---|---|---|---|---|
+| 7 cols, stats | 1322 KB | 5662 B | 32.3 ms | 311 MB |
+| 7 cols, no stats | 555 KB | 3814 B | 18.1 ms | 210 MB |
+| 2 cols, stats | 403 KB | 1753 B | 9.2 ms | 96 MB |
+| 2 cols, no stats | 173 KB | 1222 B | 6.3 ms | 67 MB |
 
-Smallest change, fully backward-compatible. Keep `min_value` /
-`max_value` as `Uint8Array` views over the original footer buffer;
-decode to string/number on access via getter. Most callers that don't
-filter never read most stats.
+- Stats are **33%** of retained heap, not 60–80%. Even removing *all* stat memory (the ceiling for option 1) leaves 24 fine-grained shards at 210 MB, over a 128 MB Worker.
+- Projecting to the 2 columns a query needs gets to 96 MB with stats, 67 MB without. Column projection is the lever that reaches fine-grained rgs.
+- Stats are 44% of parse time, but that is an upper bound for option 1's CPU win: stat bytes also make the footer 2.4× larger, and lazy decoding still walks them (it skips only the string decode and allocation).
+- The measurements are synthetic (one row per row group; footer cost per rg is roughly independent of rows per rg). A real-shard confirmation would be to rerun the probe against a ctbk h1 shard from R2.
 
-Implementation sketch: in the `Statistics` parser, replace the eager
-decode with a `get min_value() { return this._minBytes ? decode(this._minBytes, type) : undefined }` pattern. Tricky bit: TypeScript types
-need to keep advertising `string | number | undefined` for the public
-shape — the laziness is invisible to consumers.
+Probe: `tmp/heap-footer.mjs` in the hyparquet working copy (untracked; needs `hyparquet-writer`, which is not a devDep). It should land as a bench script alongside whichever option is implemented.
 
-Estimated win for ctbk's workload: 60-80% of the per-rg memory (stats
-strings dominate at our col-types).
+## Options, re-ranked by measured payoff
 
-### 2. `metadataColumns` projection
+### 2. `metadataColumns` projection (do first)
 
-Analogous to the existing `columns` data projection: a parser option
-saying "only materialize `ColumnChunkMetaData` for these columns;
-return placeholder/skip-bytes objects for the rest." Big win for query
-planners that filter on 1-2 columns and never inspect the rest.
-
-API:
+Analogous to the existing `columns` data projection: a parser option saying "only materialize `ColumnChunkMetaData` for these columns; skip over the rest." Cuts the object *count*, which is what dominates.
 
 ```ts
-parquetMetadataAsync(file, { metadataColumns: ['station_id'] })
+parquetMetadataAsync(file, { metadataColumns: ['s2_cell', 'bikes'] })
 ```
 
-Caveats: `parquetPlan` currently iterates *all* columns of each rg to
-build byte ranges, so `metadataColumns` only helps when paired with
-`columns` (which already restricts what `parquetPlan` examines). Worth
-verifying the interaction.
+Constraints found in 1.31.1's planner:
+
+- `rowGroup.columns` must keep one entry per physical column: `filter.js` (`canSkipRowGroup`) indexes it by physical position. Skipped columns need placeholders, not removal.
+- `parquetPlanGroup` throws `parquet column metadata is undefined` on a missing `meta_data` *before* its `columns` check (`src/plan.js`), so placeholders need a `path_in_schema`, or that check must move after the projection filter.
+- `metadataColumns` must cover `columns` plus every filter column (stats pruning, bloom and page-index lookups read those chunks' metadata). Deriving it from `columns` + `filter` when unset is worth considering.
+
+### 1. Lazy stats decode (modest add-on)
+
+Keep `min_value` / `max_value` as `Uint8Array` views over the footer buffer and decode on access via getter; TypeScript types keep advertising the decoded shape. Backward-compatible. Measured ceiling: ~33% of retained heap, at most 44% of parse time. Worth doing on top of option 2 (96 → 67 MB in the table), not instead of it.
 
 ### 3. Lazy `row_groups` array
 
-Biggest change, biggest payoff. Parse the outer footer once recording
-per-rg byte offsets; return a `Proxy`/Array-like that materializes each
-rg on indexing. Trades memory for re-parse CPU on multi-pass reads.
-Lets callers go back to fine-grained rgs (1 station/rg) without OOM.
+Parse the outer footer once recording per-rg byte offsets; return an Array-like that materializes each rg on indexing. Biggest payoff, biggest change: call sites assume a plain array, and spread copies re-materialize everything, so it would need an opt-in flag.
 
-Tricky: many existing call sites assume `meta.row_groups` is a plain
-array (loops, `.length`, `.map`, etc.). Proxy mostly works but spread
-copies (`[...meta.row_groups]`) re-materialize everything. Probably
-needs a flag to opt in.
+A caller-side equivalent already exists in pyrmts: `SnapshotReader`'s `RowGroupIndex` hook takes per-rg row ranges and stats from D1 or a manifest, fetches no footer, and decodes through a synthetic footer holding only the row groups a read touches. Callers with an external rg index can use that pattern today; option 3 is for callers without one.
 
 ## Out of scope
 
-- **Range-reading footer** (`suffixStart`-style). Already supported via
-  `parquetMetadataAsync` options; doesn't address parsed-memory cost.
-- **Streaming Thrift parse**. CompactProtocol is sequential; no
-  meaningful intra-footer streaming win.
+- **Range-reading footer** (`suffixStart`-style). Already supported via `parquetMetadataAsync` options; doesn't address parsed cost.
+- **Streaming Thrift parse**. CompactProtocol is sequential; no meaningful intra-footer streaming win.
+- **Row assembly cost.** pyrmts measured ~3.4 ms to decode an 8,192-row × 4-column group via `parquetReadObjects` (vs ~0.02 ms in pyarrow), mostly per-row object assembly. That is data decoding, not footer parsing; pyrmts is trying a columnar `onChunk` consumer first.
 
 ## Acceptance
 
-For (1), at minimum: a benchmark in `test/` that constructs a fake
-metadata with K rgs × 12 cols × stats and asserts post-parse retained
-heap is < (constant + small × K), comparable to the same shape today.
-Measured via `process.memoryUsage().heapUsed` deltas.
-
-For (2)/(3): API design + tests + a doc note in README. ctbk would be a
-willing real-world consumer.
+- Option 2: API + tests (placeholder layout, filter-column interaction, `parquetPlan` with projected metadata) + README note, and the probe rerun showing the "2 cols" retained-heap row for a 7-column file parsed with `metadataColumns` of 2.
+- Option 1: the probe showing retained heap per rg down by the stat share (~33%) for the same shape.
+- ctbk is a willing real-world consumer for both.
 
 ## References
 
-- ctbk workload: `gbfs/api/src/index.ts` `executeAvailTotalsQuery` /
-  `readH1ShardForStation` / `readR2ParquetStationPruned`.
-- Workaround in ctbk: `gbfs/compactor/src/index.ts` `rowGroupSize: 600`
-  (commit `85b03615` in ctbk).
-- Related ctbk spec: `specs/done/h1-stats-fix.md` (full diagnosis +
-  measurements for the OOM repro).
+- ctbk workload: `gbfs/api/src/index.ts` `executeAvailTotalsQuery` / `readH1ShardForStation` / `readR2ParquetStationPruned`.
+- Workaround in ctbk: `gbfs/compactor/src/index.ts` `rowGroupSize: 600` (commit `85b03615` in ctbk).
+- Related ctbk spec: `specs/done/h1-stats-fix.md` (full diagnosis + measurements for the OOM repro).
+- pyrmts `RowGroupIndex` hook: `js/packages/pyrmts/src/walkdiff.ts` (`SnapshotReader({ rowGroups })`), pyrmts commit `b4df01d`.
