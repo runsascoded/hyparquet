@@ -348,6 +348,97 @@ describe('asyncBufferFromUrl', () => {
     await expect(withHeaders.slice(0, 10)).rejects.toThrow('fetch failed 404')
   })
 
+  describe('with suffixFetchSize', () => {
+    /**
+     * Bytes [start, end) of a file whose byte i is i % 256.
+     *
+     * @param {number} start
+     * @param {number} end
+     * @returns {ArrayBuffer}
+     */
+    function bytes(start, end) {
+      return Uint8Array.from({ length: end - start }, (_, i) => (start + i) % 256).buffer
+    }
+    /**
+     * Mock 206 response for bytes [start, end) of a file of length total.
+     *
+     * @param {number} start
+     * @param {number} end
+     * @param {number} total
+     * @returns {object}
+     */
+    function partial(start, end, total) {
+      return {
+        ok: true,
+        status: 206,
+        body: {},
+        headers: new Map([['Content-Range', `bytes ${start}-${end - 1}/${total}`]]),
+        arrayBuffer: () => Promise.resolve(bytes(start, end)),
+      }
+    }
+
+    it('learns byteLength from one suffix GET and serves in-tail slices from it', async () => {
+      global.fetch = vi.fn().mockResolvedValueOnce(partial(924, 1024, 1024))
+      const buffer = await asyncBufferFromUrl({ url: 'https://example.com', suffixFetchSize: 100 })
+      expect(buffer.byteLength).toBe(1024)
+      expect(new Uint8Array(await buffer.slice(1000, 1024))).toEqual(new Uint8Array(bytes(1000, 1024)))
+      expect(new Uint8Array(await buffer.slice(924))).toEqual(new Uint8Array(bytes(924, 1024)))
+      expect(fetch).toHaveBeenCalledTimes(1)
+      expect(fetch).toHaveBeenCalledWith('https://example.com', { headers: new Headers({ Range: 'bytes=-100' }) })
+    })
+
+    it('fetches slices outside the tail with ranged GETs', async () => {
+      global.fetch = vi.fn()
+        .mockResolvedValueOnce(partial(924, 1024, 1024))
+        .mockResolvedValueOnce(partial(900, 1000, 1024))
+      const buffer = await asyncBufferFromUrl({ url: 'https://example.com', suffixFetchSize: 100 })
+      expect(new Uint8Array(await buffer.slice(900, 1000))).toEqual(new Uint8Array(bytes(900, 1000)))
+      expect(fetch).toHaveBeenCalledTimes(2)
+      expect(fetch).toHaveBeenLastCalledWith('https://example.com', { headers: new Headers({ Range: 'bytes=900-999' }) })
+    })
+
+    it('serves every slice from memory when the file is smaller than the suffix', async () => {
+      global.fetch = vi.fn().mockResolvedValueOnce(partial(0, 50, 50))
+      const buffer = await asyncBufferFromUrl({ url: 'https://example.com', suffixFetchSize: 100 })
+      expect(buffer.byteLength).toBe(50)
+      expect(new Uint8Array(await buffer.slice(0, 10))).toEqual(new Uint8Array(bytes(0, 10)))
+      expect(fetch).toHaveBeenCalledTimes(1)
+    })
+
+    it('uses the whole body when the server ignores the range', async () => {
+      global.fetch = vi.fn().mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        body: {},
+        headers: new Map(),
+        arrayBuffer: () => Promise.resolve(bytes(0, 300)),
+      })
+      const buffer = await asyncBufferFromUrl({ url: 'https://example.com', suffixFetchSize: 100 })
+      expect(buffer.byteLength).toBe(300)
+      expect(new Uint8Array(await buffer.slice(5, 8))).toEqual(new Uint8Array([5, 6, 7]))
+      expect(fetch).toHaveBeenCalledTimes(1)
+    })
+
+    it('falls back to HEAD when Content-Range is unreadable', async () => {
+      const cancel = vi.fn(() => Promise.resolve())
+      global.fetch = vi.fn()
+        .mockResolvedValueOnce({ ok: true, status: 206, body: { cancel }, headers: new Map() })
+        .mockResolvedValueOnce({ ok: true, status: 200, headers: new Map([['Content-Length', '1024']]) })
+      const buffer = await asyncBufferFromUrl({ url: 'https://example.com', suffixFetchSize: 100 })
+      expect(buffer.byteLength).toBe(1024)
+      expect(cancel).toHaveBeenCalledTimes(1)
+      expect(fetch).toHaveBeenCalledTimes(2)
+      expect(fetch).toHaveBeenLastCalledWith('https://example.com', { method: 'HEAD' })
+    })
+
+    it('skips the suffix GET when byteLength is given', async () => {
+      global.fetch = vi.fn()
+      const buffer = await asyncBufferFromUrl({ url: 'https://example.com', byteLength: 2048, suffixFetchSize: 100 })
+      expect(buffer.byteLength).toBe(2048)
+      expect(fetch).not.toHaveBeenCalled()
+    })
+  })
+
   describe('when range requests are unsupported', () => {
     it('creates an AsyncBuffer with the correct byte length', async () => {
       const mockArrayBuffer = new ArrayBuffer(1024)

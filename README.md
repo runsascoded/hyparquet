@@ -116,6 +116,7 @@ If you want to read a parquet file remotely over http, use `asyncBufferFromUrl` 
 
  - Pass `requestInit` option to provide additional fetch headers for authentication (optional)
  - Pass `byteLength` if you know the file size to save a round trip HEAD request (optional)
+ - Otherwise, pass `suffixFetchSize` (e.g. `512 * 1024`) to replace the HEAD with one `Range: bytes=-N` GET: the file size comes from its `Content-Range`, and the returned tail serves the footer read, so opening a file takes one request instead of two. It falls back to HEAD if `Content-Range` can't be read. Cross-origin in a browser, this needs the server to list `Content-Range` in `Access-Control-Expose-Headers`, and the request is preflighted (optional)
 
 ```typescript
 const url = 'https://s3.hyperparam.app/wiki_en.parquet'

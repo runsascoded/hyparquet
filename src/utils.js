@@ -158,29 +158,74 @@ export async function byteLengthFromUrl(url, requestInit, customFetch) {
 }
 
 /**
+ * GET the last `size` bytes of a URL. Resolves to the tail and the file's total
+ * length (from Content-Range), or to the whole body if the server ignored the
+ * range; undefined if the total length can't be read (e.g. CORS hides
+ * Content-Range), so the caller can fall back to a HEAD request.
+ *
+ * @param {string} url
+ * @param {number} size
+ * @param {RequestInit} [requestInit]
+ * @param {typeof globalThis.fetch} [fetchFn]
+ * @returns {Promise<{ status: 200, body: ArrayBuffer } | { status: 206, body: ArrayBuffer, byteLength: number } | undefined>}
+ */
+async function fetchSuffix(url, size, requestInit = {}, fetchFn = globalThis.fetch) {
+  const headers = new Headers(requestInit.headers)
+  headers.set('Range', `bytes=-${size}`)
+  const res = await fetchFn(url, { ...requestInit, headers })
+  if (res.status === 200) return { status: 200, body: await res.arrayBuffer() }
+  const total = res.status === 206 ? res.headers.get('Content-Range')?.match(/^bytes \d+-\d+\/(\d+)$/) : undefined
+  if (!total) {
+    await res.body?.cancel()
+    return undefined
+  }
+  return { status: 206, body: await res.arrayBuffer(), byteLength: parseInt(total[1]) }
+}
+
+/**
  * Construct an AsyncBuffer for a URL.
- * If byteLength is not provided, will make a HEAD request to get the file size.
+ * If byteLength is not provided, will make a HEAD request to get the file size,
+ * or, with suffixFetchSize, one suffix-range GET that also returns the file's tail.
  * If fetch is provided, it will be used instead of the global fetch.
  * If requestInit is provided, it will be passed to fetch.
  *
  * @param {object} options
  * @param {string} options.url
  * @param {number} [options.byteLength]
+ * @param {number} [options.suffixFetchSize] if byteLength is unknown, GET this many bytes from the end of the file, learning byteLength from Content-Range (falls back to HEAD)
  * @param {typeof globalThis.fetch} [options.fetch] fetch function to use
  * @param {RequestInit} [options.requestInit]
  * @returns {Promise<AsyncBuffer>}
  */
-export async function asyncBufferFromUrl({ url, byteLength, requestInit, fetch: customFetch }) {
+export async function asyncBufferFromUrl({ url, byteLength, suffixFetchSize, requestInit, fetch: customFetch }) {
   if (!url) throw new Error('missing url')
   const fetch = customFetch ?? globalThis.fetch
-  // byte length from HEAD request
-  byteLength ??= await byteLengthFromUrl(url, requestInit, fetch)
 
   /**
    * A promise for the whole buffer, if range requests are not supported.
    * @type {Promise<ArrayBuffer>|undefined}
    */
   let buffer = undefined
+  /**
+   * Tail of the file from the suffix-range GET, starting at tailStart.
+   * @type {ArrayBuffer|undefined}
+   */
+  let tail = undefined
+  let tailStart = 0
+
+  if (byteLength === undefined && suffixFetchSize) {
+    const suffix = await fetchSuffix(url, suffixFetchSize, requestInit, fetch)
+    if (suffix?.status === 200) {
+      ({ byteLength } = suffix.body)
+      buffer = Promise.resolve(suffix.body)
+    } else if (suffix) {
+      ({ byteLength, body: tail } = suffix)
+      tailStart = byteLength - tail.byteLength
+    }
+  }
+  // byte length from HEAD request
+  byteLength ??= await byteLengthFromUrl(url, requestInit, fetch)
+  const length = byteLength
   const init = requestInit || {}
 
   return {
@@ -188,6 +233,9 @@ export async function asyncBufferFromUrl({ url, byteLength, requestInit, fetch: 
     async slice(start, end) {
       if (buffer) {
         return buffer.then(buffer => buffer.slice(start, end))
+      }
+      if (tail && start >= tailStart && (end ?? length) <= length) {
+        return tail.slice(start - tailStart, (end ?? length) - tailStart)
       }
 
       const headers = new Headers(init.headers)

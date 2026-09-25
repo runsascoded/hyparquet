@@ -1,6 +1,6 @@
 # Spec: open a URL of unknown size with one suffix-range GET
 
-Status: **open** (2026-09-25). Supersedes the `optional-byteLength` branch (2024-02, v0.2.3), which made `AsyncBuffer.byteLength` optional and read footers with suffix ranges; its code predates most of the current reader.
+Status: **done** (2026-09-25). Supersedes the `optional-byteLength` branch (2024-02, v0.2.3), which made `AsyncBuffer.byteLength` optional and read footers with suffix ranges; its code predates most of the current reader.
 
 ## Problem
 
@@ -22,6 +22,12 @@ Server-side (Node, CFW `fetch` of a public URL) this is a pure win: two round tr
 
 - A suffix range is not a CORS-safelisted `Range` form, so the request is preflighted (cacheable via `Access-Control-Max-Age`).
 - JS can only read `Content-Range` if the server lists it in `Access-Control-Expose-Headers`. ctbk's R2 CORS currently exposes `Accept-Ranges, Content-Encoding, Content-Length, ETag`, not `Content-Range`, so there it would fall back to HEAD after a wasted GET.
+
+## As built
+
+- `asyncBufferFromUrl({ url, suffixFetchSize })` in `src/utils.js`, with a private `fetchSuffix` helper. The tail stays in memory for the buffer's lifetime; slices fully inside it never hit the network, others use the usual ranged GETs.
+- Tests: `test/utils.test.js` "with suffixFetchSize" (the six cases below). README: `asyncBufferFromUrl` section.
+- Live on `data.ctbk.dev` (`avail/agg/h1/2026-09-20.parquet`): `asyncBufferFromUrl` + `parquetMetadataAsync` made 2 requests (`HEAD`, `GET bytes=1040944-1565231`) without the option, 1 (`GET bytes=-524288`) with `suffixFetchSize: 512 * 1024`; same `byteLength` and 211 row groups.
 
 ## Non-goals
 
