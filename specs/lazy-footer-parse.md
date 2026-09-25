@@ -1,6 +1,6 @@
 # Spec: lazy footer parsing for high-rg-count shards
 
-Status: **open** (2026-05-02; measured and re-ranked 2026-09-23 on hyparquet 1.31.1; confirmed on real ctbk shards 2026-09-25). Author: ryan@runsascoded.com (originating workload: ctbk.dev `gbfs/api` Cloudflare Worker).
+Status: **open** (2026-05-02; measured and re-ranked 2026-09-23 on hyparquet 1.31.1; confirmed on real ctbk shards 2026-09-25; option 2 implemented 2026-09-25, options 1 and 3 open). Author: ryan@runsascoded.com (originating workload: ctbk.dev `gbfs/api` Cloudflare Worker).
 
 ## Problem
 
@@ -52,23 +52,34 @@ Probes (untracked, in the hyparquet working copy): `tmp/heap-footer.mjs` (synthe
 
 ## Options, re-ranked by measured payoff
 
-### 2. `metadataColumns` projection (do first)
+### 2. `metadataColumns` projection (done 2026-09-25)
 
-Analogous to the existing `columns` data projection: a parser option saying "only materialize `ColumnChunkMetaData` for these columns; skip over the rest." Cuts the object *count*, which is what dominates.
+A parser option listing the top-level columns whose column-chunk metadata to materialize. Cuts the object *count*, which is what dominates.
 
 ```ts
-parquetMetadataAsync(file, { metadataColumns: ['s2_cell', 'bikes'] })
+const metadata = await parquetMetadataAsync(file, { metadataColumns: ['station_id', 'bikes'] })
+await parquetReadObjects({ file, metadata, columns: ['bikes'], filter: { station_id: { $eq: 'x' } } })
 ```
 
-Constraints found in 1.31.1's planner:
+As built:
 
-- `rowGroup.columns` must keep one entry per physical column: `filter.js` (`canSkipRowGroup`) indexes it by physical position. Skipped columns need placeholders, not removal.
-- `parquetPlanGroup` throws `parquet column metadata is undefined` on a missing `meta_data` *before* its `columns` check (`src/plan.js`), so placeholders need a `path_in_schema`, or that check must move after the projection filter.
-- `metadataColumns` must cover `columns` plus every filter column (stats pruning, bloom and page-index lookups read those chunks' metadata). Deriving it from `columns` + `filter` when unset is worth considering.
+- Projection happens in `parquetMetadata`'s mapping pass (raw Thrift tree → typed objects), so it cuts *retained* heap. Skipped chunks become one shared, frozen, empty `skippedColumnChunk` (exported), keeping their slot: `filter.js` indexes `rowGroup.columns` by physical position. A per-chunk `{ file_offset }` placeholder cost ~56 B/chunk, which on the real 12-col shard was the difference between 139 MB and 109 MB at the fine-grained repro; `ColumnChunk.file_offset` (deprecated, unread anywhere in `src/`) became optional so the shared placeholder is honest.
+- Reads that need an unparsed chunk throw `parquet column metadata is undefined: <cols> (not in metadataColumns?)`: reading all columns, a requested column, or a filter column (the read adds filter columns to `columns`). The check lives in `parquetPlanGroup`, not `parquetPlanGroups`: lazy scans (upstream #172/#173) deliberately don't touch `rowGroup.columns` while preparing a scan. Stats pruning on an unparsed column degrades to "cannot prune"; page-range splitting ignores placeholders.
+- `metadataColumns` is also a read option, forwarded when the read parses metadata itself. It is opt-in: not derived from `columns` + `filter`, since reads write parsed metadata back into the caller's options object (`options.metadata ??=`), where a derived partial footer could surprise a caller reusing it.
+- Tests: `test/metadataColumns.test.js`. README: "Parsing metadata for some columns".
+
+Measured (`tmp/heap-mdcols.mjs`, 2 of the file's columns listed):
+
+| file | full | `metadataColumns` | ×24 shards at 2400 rgs |
+|---|---|---|---|
+| real `gbfs/avail/h1/2026-09-24/12` (12 cols) | 9841 B/rg | 1979 B/rg | 541 → 109 MB |
+| synthetic avail-v3 (7 cols) | 5695 B/rg | 1804 B/rg | 313 → 99 MB |
+
+Parse time is ~unchanged (5.6 → 5.4 ms; 28 → 25 ms): `deserializeTCompactProtocol` still materializes the whole raw tree before the mapping pass. **Follow-up:** skip non-listed column chunks inside the Thrift decoder for a CPU win (the raw tree is transient, so this is CPU and peak heap, not retained heap).
 
 ### 1. Lazy stats decode (minor add-on)
 
-Keep `min_value` / `max_value` as `Uint8Array` views over the footer buffer and decode on access via getter; TypeScript types keep advertising the decoded shape. Backward-compatible. Measured ceiling: 13–16% of retained heap on real shards (33% on the synthetic long-string shape), at most 44% of parse time. Worth doing on top of option 2 (96 → 67 MB in the table), not instead of it.
+Keep `min_value` / `max_value` as `Uint8Array` views over the footer buffer and decode on access via getter; TypeScript types keep advertising the decoded shape. Backward-compatible. Measured ceiling: 13–16% of retained heap on real shards (33% on the synthetic long-string shape), at most 44% of parse time. Worth doing on top of option 2, not instead of it.
 
 ### 3. Lazy `row_groups` array
 
@@ -84,7 +95,7 @@ A caller-side equivalent already exists in pyrmts: `SnapshotReader`'s `RowGroupI
 
 ## Acceptance
 
-- Option 2: API + tests (placeholder layout, filter-column interaction, `parquetPlan` with projected metadata) + README note, and the probe rerun showing the "2 cols" retained-heap row for a 7-column file parsed with `metadataColumns` of 2.
+- Option 2: done (see As built).
 - Option 1: the probe showing retained heap per rg down by the stat share (13–16% on real shards) for the same shape.
 - ctbk is a willing real-world consumer for both.
 

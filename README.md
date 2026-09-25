@@ -85,6 +85,17 @@ const schema = parquetSchema(metadata)
 const columnNames = schema.children.map(e => e.element.name)
 ```
 
+#### Parsing metadata for some columns
+
+Parsed metadata holds a column-chunk object per column per row group, which adds up for files with many row groups (roughly 1 KB per chunk). If you only read or filter on a few columns, `metadataColumns` parses just those; other chunks become the shared empty placeholder `skippedColumnChunk`:
+
+```javascript
+const metadata = await parquetMetadataAsync(file, { metadataColumns: ['station_id', 'bikes'] })
+const rows = await parquetReadObjects({ file, metadata, columns: ['bikes'], filter: { station_id: { $eq: 'x' } } })
+```
+
+`metadataColumns` must cover every column you read or filter on; reading any other column throws. Schema, row counts and row-group statistics for the listed columns are unaffected.
+
 ### AsyncBuffer
 
 Hyparquet requires an argument `file` of type `AsyncBuffer`. An `AsyncBuffer` is similar to a js `ArrayBuffer` but the `slice` method can return async `Promise<ArrayBuffer>`. This makes it a useful way to represent a remote file.
