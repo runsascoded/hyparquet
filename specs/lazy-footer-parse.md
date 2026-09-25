@@ -1,6 +1,6 @@
 # Spec: lazy footer parsing for high-rg-count shards
 
-Status: **open** (2026-05-02; measured and re-ranked 2026-09-23 on hyparquet 1.31.1). Author: ryan@runsascoded.com (originating workload: ctbk.dev `gbfs/api` Cloudflare Worker).
+Status: **open** (2026-05-02; measured and re-ranked 2026-09-23 on hyparquet 1.31.1; confirmed on real ctbk shards 2026-09-25). Author: ryan@runsascoded.com (originating workload: ctbk.dev `gbfs/api` Cloudflare Worker).
 
 ## Problem
 
@@ -32,9 +32,23 @@ Synthetic files modelled on ctbk's avail-v3 aggregate schema (`s2_cell` STRING, 
 - Stats are **33%** of retained heap, not 60–80%. Even removing *all* stat memory (the ceiling for option 1) leaves 24 fine-grained shards at 210 MB, over a 128 MB Worker.
 - Projecting to the 2 columns a query needs gets to 96 MB with stats, 67 MB without. Column projection is the lever that reaches fine-grained rgs.
 - Stats are 44% of parse time, but that is an upper bound for option 1's CPU win: stat bytes also make the footer 2.4× larger, and lazy decoding still walks them (it skips only the string decode and allocation).
-- The measurements are synthetic (one row per row group; footer cost per rg is roughly independent of rows per rg). A real-shard confirmation would be to rerun the probe against a ctbk h1 shard from R2.
 
-Probe: `tmp/heap-footer.mjs` in the hyparquet working copy (untracked; needs `hyparquet-writer`, which is not a devDep). It should land as a bench script alongside whichever option is implemented.
+### Real shards (2026-09-25, from `data.ctbk.dev`)
+
+Parsed real ctbk footers, then simulated each option on the parsed metadata: option 1 by setting every `statistics` to `undefined`, option 2 by nulling non-projected column-chunk entries, measuring retained heap after each. (`delete`-ing the properties instead pushes V8 objects into dictionary mode and *raises* heap, which reads as a negative stat share; avoid it.)
+
+| shard | shape | footer | parse | retained / rg | stat share | projected + no stats |
+|---|---|---|---|---|---|---|
+| `avail/agg/h1/2026-09-20` | 211 rgs × 5 cols | 117 KB | 3.0 ms | 5197 B | 13% | 4 of 5 cols: 757 KB total |
+| `gbfs/avail/h1/2026-09-24/12` | 248 rgs × 12 cols | 242 KB | 7–11 ms | 9839 B | 14–16% | `station_id` + 1 metric: 367 KB total |
+
+- Real stat strings are short (avg 1.3–7.7 chars per stat), so stats matter *less* than in the synthetic run.
+- Per column chunk, real and synthetic agree: ~820 B (12-col shard) and ~1040 B (5-col shard) of retained heap.
+- Today's shards are at the coarse workaround grain (211–248 rgs): 24 of them retain 25–57 MB, fine.
+- Scaled to the spec's fine-grained repro (2400 rgs × 24 shards) using the 12-col shard's per-rg costs: **540 MB** as is, **467 MB** with no stats at all (option 1's ceiling), **83 MB** with metadata for `station_id` + one metric and no stats (option 2). Option 2 is required; option 1 alone does not come close.
+- Parse CPU scales the same way: 7–11 ms for 248 rgs suggests ~70–100 ms per fine-grained 12-col footer, ~2 s across 24 shards. Unmeasured how much of that `metadataColumns` saves, since the parser must still walk the skipped chunks' bytes.
+
+Probes (untracked, in the hyparquet working copy): `tmp/heap-footer.mjs` (synthetic; needs `hyparquet-writer`, which is not a devDep) and `tmp/heap-real2.mjs` (real files, option simulation). One should land as a bench script alongside whichever option is implemented.
 
 ## Options, re-ranked by measured payoff
 
@@ -52,9 +66,9 @@ Constraints found in 1.31.1's planner:
 - `parquetPlanGroup` throws `parquet column metadata is undefined` on a missing `meta_data` *before* its `columns` check (`src/plan.js`), so placeholders need a `path_in_schema`, or that check must move after the projection filter.
 - `metadataColumns` must cover `columns` plus every filter column (stats pruning, bloom and page-index lookups read those chunks' metadata). Deriving it from `columns` + `filter` when unset is worth considering.
 
-### 1. Lazy stats decode (modest add-on)
+### 1. Lazy stats decode (minor add-on)
 
-Keep `min_value` / `max_value` as `Uint8Array` views over the footer buffer and decode on access via getter; TypeScript types keep advertising the decoded shape. Backward-compatible. Measured ceiling: ~33% of retained heap, at most 44% of parse time. Worth doing on top of option 2 (96 → 67 MB in the table), not instead of it.
+Keep `min_value` / `max_value` as `Uint8Array` views over the footer buffer and decode on access via getter; TypeScript types keep advertising the decoded shape. Backward-compatible. Measured ceiling: 13–16% of retained heap on real shards (33% on the synthetic long-string shape), at most 44% of parse time. Worth doing on top of option 2 (96 → 67 MB in the table), not instead of it.
 
 ### 3. Lazy `row_groups` array
 
@@ -71,7 +85,7 @@ A caller-side equivalent already exists in pyrmts: `SnapshotReader`'s `RowGroupI
 ## Acceptance
 
 - Option 2: API + tests (placeholder layout, filter-column interaction, `parquetPlan` with projected metadata) + README note, and the probe rerun showing the "2 cols" retained-heap row for a 7-column file parsed with `metadataColumns` of 2.
-- Option 1: the probe showing retained heap per rg down by the stat share (~33%) for the same shape.
+- Option 1: the probe showing retained heap per rg down by the stat share (13–16% on real shards) for the same shape.
 - ctbk is a willing real-world consumer for both.
 
 ## References
