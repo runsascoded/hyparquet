@@ -1,5 +1,5 @@
 export { readColumnIndex, readOffsetIndex } from './indexes.js';
-export { parquetMetadata, parquetMetadataAsync, parquetSchema } from './metadata.js';
+export { parquetMetadata, parquetMetadataAsync, parquetSchema, skippedColumnChunk } from './metadata.js';
 export { parquetRead, parquetReadObjects, rowIndex } from './read.js';
 export { parquetScan } from './scan.js';
 export { parquetQuery } from './query.js';

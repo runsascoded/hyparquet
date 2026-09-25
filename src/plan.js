@@ -99,6 +99,7 @@ export function parquetPlanGroups({ metadata, rowStart = 0, rowEnd = Infinity, c
 
       if (ranges.length > 1) {
         const canSplit = rowGroup.columns.every(chunk => {
+          if (!chunk.meta_data) return true // not parsed, so not read
           const columnName = chunk.meta_data?.path_in_schema[0]
           const columnPath = chunk.meta_data?.path_in_schema.join('.')
           if (columns && columnName && !columns.includes(columnName)) return true
@@ -139,10 +140,15 @@ export function parquetPlanGroup({ rowGroup, groupStart, groupRows, ranges, colu
   /** @type {ByteRange[]} */
   const indexes = []
   const narrowed = ranges.length > 1 || ranges[0][0] > 0 || ranges[0][1] < groupRows
+  let unparsed = false
   for (const chunk of rowGroup.columns) {
     const meta = chunk.meta_data
     if (chunk.file_path) throw new Error('parquet file_path not supported')
-    if (!meta) throw new Error('parquet column metadata is undefined')
+    if (!meta) {
+      // placeholder: metadata not parsed (see metadataColumns)
+      unparsed = true
+      continue
+    }
     if (columns && !columns.includes(meta.path_in_schema[0])) continue
     const columnOffset = meta.dictionary_page_offset || meta.data_page_offset
     const startByte = Number(columnOffset)
@@ -161,6 +167,12 @@ export function parquetPlanGroup({ rowGroup, groupStart, groupRows, ranges, colu
     } else {
       chunks.push({ columnMetadata: meta, range: { startByte, endByte } })
     }
+  }
+
+  if (unparsed) {
+    const planned = new Set(chunks.map(chunk => chunk.columnMetadata.path_in_schema[0]))
+    const missing = columns ? columns.filter(column => !planned.has(column)) : ['(all columns)']
+    if (missing.length) throw new Error(`parquet column metadata is undefined: ${missing.join(', ')} (not in metadataColumns?)`)
   }
 
   // raw ranges; callers coalesce (parquetPlan does so across row groups)

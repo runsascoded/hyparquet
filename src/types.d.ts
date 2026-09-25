@@ -23,6 +23,7 @@ export interface ParquetParsers {
 export interface MetadataOptions {
   parsers?: Partial<ParquetParsers> // custom parsers to decode advanced types, merged over the defaults
   geoparquet?: boolean // parse geoparquet metadata and set logical type to geometry/geography for geospatial columns (default true)
+  metadataColumns?: string[] // top-level columns whose column-chunk metadata to parse; other chunks are the shared empty `skippedColumnChunk` and cannot be read (default all)
 }
 
 /**
@@ -51,6 +52,7 @@ export interface BaseParquetReadOptions {
   utf8?: boolean // decode byte arrays as utf8 strings (default true)
   parsers?: Partial<ParquetParsers> // custom parsers to decode advanced types, merged over the defaults
   geoparquet?: boolean // parse geoparquet metadata and set logical type to geometry/geography for geospatial columns (default true)
+  metadataColumns?: string[] // when metadata is parsed by this call: top-level columns whose column-chunk metadata to parse (must cover `columns` and filter columns)
   useOffsetIndex?: boolean // use offset index to limit column chunk reads when available (default false)
   useBloomFilters?: boolean // fetch bloom filters to enable row-group skipping on $eq/$in predicates (default false)
   usePageIndex?: boolean // fetch page indexes (column index + offset index) for filter columns to skip pages that cannot match (default false)
@@ -265,7 +267,7 @@ export interface RowGroup {
 
 export interface ColumnChunk {
   file_path?: string
-  file_offset: bigint
+  file_offset?: bigint // absent on chunks skipped by `metadataColumns`
   meta_data?: ColumnMetaData
   offset_index_offset?: bigint
   offset_index_length?: number

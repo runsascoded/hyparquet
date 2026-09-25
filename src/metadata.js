@@ -5,12 +5,21 @@ import { deserializeTCompactProtocol } from './thrift.js'
 import { markGeoColumns } from './geoparquet.js'
 
 /**
- * @import {AsyncBuffer, FileMetaData, KeyValue, LogicalType, MetadataOptions, MinMaxType, ParquetParsers, SchemaElement, SchemaTree, Statistics, TimeUnit} from '../src/types.js'
+ * @import {AsyncBuffer, ColumnChunk, FileMetaData, KeyValue, LogicalType, MetadataOptions, MinMaxType, ParquetParsers, SchemaElement, SchemaTree, Statistics, TimeUnit} from '../src/types.js'
  */
 
 export const defaultInitialFetchSize = 1 << 19 // 512kb
 
 const decoder = new TextDecoder()
+/**
+ * Shared placeholder for column chunks not listed in `metadataColumns`: it keeps
+ * the chunk's slot (chunks are indexed by physical position) without retaining
+ * any per-chunk objects.
+ *
+ * @type {Readonly<ColumnChunk>}
+ */
+export const skippedColumnChunk = Object.freeze({})
+
 function decode(/** @type {Uint8Array} */ value) {
   return value && decoder.decode(value)
 }
@@ -39,7 +48,7 @@ function decode(/** @type {Uint8Array} */ value) {
  * @param {import('../src/types.d.ts').MetadataAsyncOptions} options
  * @returns {Promise<FileMetaData>} parquet metadata object
  */
-export async function parquetMetadataAsync(asyncBuffer, { parsers, initialFetchSize = defaultInitialFetchSize, suffixStart, geoparquet = true } = {}) {
+export async function parquetMetadataAsync(asyncBuffer, { parsers, initialFetchSize = defaultInitialFetchSize, suffixStart, geoparquet = true, metadataColumns } = {}) {
   if (!asyncBuffer || !(asyncBuffer.byteLength >= 0)) throw new Error('parquet expected AsyncBuffer')
 
   // fetch last bytes (footer) of the file
@@ -71,10 +80,10 @@ export async function parquetMetadataAsync(asyncBuffer, { parsers, initialFetchS
     const combinedView = new Uint8Array(combinedBuffer)
     combinedView.set(new Uint8Array(metadataBuffer))
     combinedView.set(new Uint8Array(footerBuffer), footerOffset - metadataOffset)
-    return parquetMetadata(combinedBuffer, { parsers, geoparquet })
+    return parquetMetadata(combinedBuffer, { parsers, geoparquet, metadataColumns })
   } else {
     // parse metadata from the footer
-    return parquetMetadata(footerBuffer, { parsers, geoparquet })
+    return parquetMetadata(footerBuffer, { parsers, geoparquet, metadataColumns })
   }
 }
 
@@ -85,7 +94,7 @@ export async function parquetMetadataAsync(asyncBuffer, { parsers, initialFetchS
  * @param {MetadataOptions} options metadata parsing options
  * @returns {FileMetaData} parquet metadata object
  */
-export function parquetMetadata(arrayBuffer, { parsers, geoparquet = true } = {}) {
+export function parquetMetadata(arrayBuffer, { parsers, geoparquet = true, metadataColumns } = {}) {
   if (!(arrayBuffer instanceof ArrayBuffer)) throw new Error('parquet expected ArrayBuffer')
   const view = new DataView(arrayBuffer)
 
@@ -131,8 +140,9 @@ export function parquetMetadata(arrayBuffer, { parsers, geoparquet = true } = {}
   // schema element per column index
   const columnSchema = schema.filter(e => e.type)
   const num_rows = metadata.field_3
+  const keepColumns = metadataColumns && new Set(metadataColumns)
   const row_groups = metadata.field_4.map((/** @type {any} */ rowGroup) => ({
-    columns: rowGroup.field_1.map((/** @type {any} */ column, /** @type {number} */ columnIndex) => ({
+    columns: rowGroup.field_1.map((/** @type {any} */ column, /** @type {number} */ columnIndex) => keepColumns && !keepColumns.has(decode(column.field_3?.field_3?.[0])) ? skippedColumnChunk : {
       file_path: decode(column.field_1),
       file_offset: column.field_2,
       meta_data: column.field_3 && {
@@ -183,7 +193,7 @@ export function parquetMetadata(arrayBuffer, { parsers, geoparquet = true } = {}
       column_index_length: column.field_7,
       crypto_metadata: column.field_8,
       encrypted_column_metadata: column.field_9,
-    })),
+    }),
     total_byte_size: rowGroup.field_2,
     num_rows: rowGroup.field_3,
     sorting_columns: rowGroup.field_4?.map((/** @type {any} */ sortingColumn) => ({

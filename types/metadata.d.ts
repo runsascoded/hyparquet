@@ -1,8 +1,16 @@
-import type { AsyncBuffer, FileMetaData, MetadataOptions, MinMaxType, ParquetParsers, SchemaElement, SchemaTree } from '../src/types.js';
+import type { AsyncBuffer, ColumnChunk, FileMetaData, MetadataOptions, MinMaxType, ParquetParsers, SchemaElement, SchemaTree } from '../src/types.js';
 /**
- * @import {AsyncBuffer, FileMetaData, KeyValue, LogicalType, MetadataOptions, MinMaxType, ParquetParsers, SchemaElement, SchemaTree, Statistics, TimeUnit} from '../src/types.js'
+ * @import {AsyncBuffer, ColumnChunk, FileMetaData, KeyValue, LogicalType, MetadataOptions, MinMaxType, ParquetParsers, SchemaElement, SchemaTree, Statistics, TimeUnit} from '../src/types.js'
  */
 export declare const defaultInitialFetchSize: number;
+/**
+ * Shared placeholder for column chunks not listed in `metadataColumns`: it keeps
+ * the chunk's slot (chunks are indexed by physical position) without retaining
+ * any per-chunk objects.
+ *
+ * @type {Readonly<ColumnChunk>}
+ */
+export declare const skippedColumnChunk: Readonly<ColumnChunk>;
 /**
  * Read parquet metadata from an async buffer.
  *
@@ -27,7 +35,7 @@ export declare const defaultInitialFetchSize: number;
  * @param {import('../src/types.d.ts').MetadataAsyncOptions} options
  * @returns {Promise<FileMetaData>} parquet metadata object
  */
-export declare function parquetMetadataAsync(asyncBuffer: AsyncBuffer, { parsers, initialFetchSize, suffixStart, geoparquet }?: import('../src/types.d.ts').MetadataAsyncOptions): Promise<FileMetaData>;
+export declare function parquetMetadataAsync(asyncBuffer: AsyncBuffer, { parsers, initialFetchSize, suffixStart, geoparquet, metadataColumns }?: import('../src/types.d.ts').MetadataAsyncOptions): Promise<FileMetaData>;
 /**
  * Read parquet metadata from a buffer synchronously.
  *
@@ -35,7 +43,7 @@ export declare function parquetMetadataAsync(asyncBuffer: AsyncBuffer, { parsers
  * @param {MetadataOptions} options metadata parsing options
  * @returns {FileMetaData} parquet metadata object
  */
-export declare function parquetMetadata(arrayBuffer: ArrayBuffer, { parsers, geoparquet }?: MetadataOptions): FileMetaData;
+export declare function parquetMetadata(arrayBuffer: ArrayBuffer, { parsers, geoparquet, metadataColumns }?: MetadataOptions): FileMetaData;
 /**
  * Return a tree of schema elements from parquet metadata.
  *
